@@ -7,17 +7,17 @@ import type { NodeId } from "./node-id";
  * @returns Uint8Array containing the XOR distance
  */
 export function calculateDistance(a: NodeId, b: NodeId): Uint8Array {
-	const aBytes = a.getBytes();
-	const bBytes = b.getBytes();
-	const aBytesLength = aBytes.length;
+  const aBytes = a.getBytes();
+  const bBytes = b.getBytes();
+  const aBytesLength = aBytes.length;
 
-	const result = new Uint8Array(aBytesLength);
+  const result = new Uint8Array(aBytesLength);
 
-	for (let i = 0; i < aBytesLength; i++) {
-		result[i] = aBytes[i] ^ bBytes[i];
-	}
+  for (let i = 0; i < aBytesLength; i++) {
+    result[i] = aBytes[i] ^ bBytes[i];
+  }
 
-	return result;
+  return result;
 }
 
 /**
@@ -30,20 +30,20 @@ export function calculateDistance(a: NodeId, b: NodeId): Uint8Array {
  *          Zero if both are equally distant from targetId
  */
 export function compareDistances(
-	targetId: NodeId,
-	aId: NodeId,
-	bId: NodeId,
+  targetId: NodeId,
+  aId: NodeId,
+  bId: NodeId,
 ): number {
-	const distanceA = calculateDistance(targetId, aId);
-	const distanceB = calculateDistance(targetId, bId);
+  const distanceA = calculateDistance(targetId, aId);
+  const distanceB = calculateDistance(targetId, bId);
 
-	// Compare byte by byte, starting from most significant byte
-	for (let i = 0; i < distanceA.length; i++) {
-		if (distanceA[i] !== distanceB[i]) {
-			return distanceA[i] - distanceB[i];
-		}
-	}
+  // Compare byte by byte, starting from most significant byte
+  for (let i = 0; i < distanceA.length; i++) {
+    if (distanceA[i] !== distanceB[i]) {
+      return distanceA[i] - distanceB[i];
+    }
+  }
 
-	// Both distances are equal
-	return 0;
+  // Both distances are equal
+  return 0;
 }
