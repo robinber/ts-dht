@@ -9,7 +9,7 @@ export class NodeId {
 	// The actual bytes of the ID stored as a Uint8Array
 	private readonly bytes: Uint8Array;
 	// Size of the NodeId in bytes (160 bits = 20 bytes)
-	private static readonly SIZE_IN_BYTES = 20 as const;
+	public static readonly SIZE_IN_BYTES = 20 as const;
 	// Size of the NodeId in bits
 	public static readonly SIZE_IN_BITS = NodeId.SIZE_IN_BYTES * 8;
 
