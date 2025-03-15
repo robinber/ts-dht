@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateDistance, compareDistances } from "../src/distance";
-import { NodeId } from "../src/node-id";
+import { NodeId, calculateDistance, compareDistances } from "./index";
 
 describe("Distance functions", () => {
   describe("calculateDistance", () => {

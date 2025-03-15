@@ -114,7 +114,8 @@
   "exclude": [
     "node_modules",
     "dist",
-    "test",
-    "src/__test__"
-  ] /* Exclude node_modules, dist, test, and all test files */
+    "**/*.test.ts",
+    "**/*.fixture.ts",
+    "**/test/**"
+  ]
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HEX_PREFIX, NodeId } from "../src/node-id";
+import { HEX_PREFIX, NodeId } from "./node-id";
 
 describe("NodeId", () => {
   // Valid test values
