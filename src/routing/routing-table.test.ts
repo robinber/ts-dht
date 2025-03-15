@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { createNodeFixture } from "../src/__test__/createNode.fixture";
+import { createNodeFixture } from "../__fixtures__/createNode.fixture";
 
-import { NodeId } from "../src/node-id";
-import { RoutingTable } from "../src/routing-table";
+import { NodeId } from "../core/node-id";
+import { RoutingTable } from "./routing-table";
 
 describe("RoutingTable", () => {
   describe("#addNode", () => {

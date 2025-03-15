@@ -1,5 +1,4 @@
-import { compareDistances } from "./distance";
-import type { NodeId } from "./node-id";
+import { type NodeId, compareDistances } from "../core";
 
 export type DHTNode = {
   id: NodeId;

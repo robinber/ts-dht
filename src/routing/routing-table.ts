@@ -1,6 +1,5 @@
-import { compareDistances } from "./distance";
+import { type NodeId, compareDistances } from "../core";
 import { type DHTNode, KBucket } from "./k-bucket";
-import type { NodeId } from "./node-id";
 
 export type RoutingTableOptions = {
   /**

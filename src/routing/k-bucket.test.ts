@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { createNodeFixture } from "../src/__test__/createNode.fixture";
-import { KBucket } from "../src/k-bucket";
-import { NodeId } from "../src/node-id";
+import { createNodeFixture } from "../__fixtures__/createNode.fixture";
+import { NodeId } from "../core";
+import { KBucket } from "./index";
 
 describe("KBucket", () => {
   describe("#addNode", () => {
