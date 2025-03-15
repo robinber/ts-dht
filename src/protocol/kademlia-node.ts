@@ -134,11 +134,8 @@ export class KademliaNode {
    * @returns Array of nodes returned by the target
    */
   async queryNode(node: DHTNode, target: NodeId): Promise<DHTNode[]> {
-    // This is a placeholder for the actual RPC call implementation
-    // In a real system, this would contact the node and request its closest nodes
-
     try {
-      // Here you would:
+      // TODO: Implement the actual RPC call
       // 1. Serialize the request
       // 2. Send it to the node using its address
       // 3. Wait for and parse the response
@@ -273,14 +270,12 @@ export class KademliaNode {
     key: NodeId,
   ): Promise<{ value: Uint8Array | null; closestNodes: DHTNode[] }> {
     try {
-      // In a real implementation, this would:
+      // TODO: Implement the actual RPC call
       // 1. Send a FIND_VALUE RPC to the node
       // 2. The node would check its local storage for the key
       // 3. If found, it would return the value
       // 4. If not found, it would return its k closest nodes to the key
 
-      // For now, we just return an empty result
-      // This will be replaced with actual network communication later
       return { value: null, closestNodes: [] };
     } catch (error) {
       console.error(
