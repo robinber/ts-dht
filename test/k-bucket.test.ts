@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { type DHTNode, KBucket } from "../src/k-bucket";
+import { createNodeFixture } from "../src/__test__/createNode.fixture";
+import { KBucket } from "../src/k-bucket";
 import { NodeId } from "../src/node-id";
 
 describe("KBucket", () => {
@@ -269,10 +270,3 @@ describe("KBucket", () => {
     });
   });
 });
-
-function createNodeFixture(hex: string): DHTNode {
-  return {
-    id: NodeId.fromHex(hex.padStart(NodeId.SIZE_IN_BYTES * 2, "0")),
-    address: "127.0.0.1:8080",
-  };
-}
