@@ -2,6 +2,8 @@ import { type NodeId, compareDistances } from "../core";
 import { type DHTNode, RoutingTable } from "../routing";
 
 const DEFAULT_TTL = 60 * 60 * 1000;
+const DEFAULT_ALPHA = 3;
+const DEFAULT_MAX_ITERATIONS = 20;
 
 export type StoreValue = {
   value: Uint8Array;
@@ -54,76 +56,22 @@ export class KademliaNode {
    */
   async findNode(
     target: NodeId,
-    alpha = 3,
+    alpha = DEFAULT_ALPHA,
     k = this.k,
-    maxIterations = 20,
+    maxIterations = DEFAULT_MAX_ITERATIONS,
   ): Promise<DHTNode[]> {
-    const queriedNodes = new Set<string>();
-    const closestNodes = this.routingTable.findClosestNodes(target, this.k);
+    const { nodes } = await this.iterativeLookup<never, DHTNode[]>(
+      target,
+      (node) => this.queryNode(node, target),
+      (nodes) => ({ nodes }),
+      {
+        alpha,
+        maxIterations,
+        k,
+      },
+    );
 
-    let currentClosestNodes = [...closestNodes];
-
-    let iterations = 0;
-
-    while (iterations < maxIterations) {
-      iterations++;
-
-      const nodesToQuery: DHTNode[] = [];
-
-      for (const node of currentClosestNodes) {
-        const nodeIdHex = node.id.toHex();
-
-        if (queriedNodes.has(nodeIdHex)) {
-          continue;
-        }
-
-        nodesToQuery.push(node);
-
-        if (nodesToQuery.length >= alpha) {
-          break;
-        }
-      }
-
-      if (nodesToQuery.length === 0) {
-        break;
-      }
-
-      const newNodes = await Promise.all(
-        nodesToQuery.map((node) => {
-          queriedNodes.add(node.id.toHex());
-
-          return this.queryNode(node, target);
-        }),
-      );
-
-      let foundCloserNodes = false;
-
-      for (const newNode of newNodes.flat()) {
-        if (this.nodeId.equals(newNode.id)) {
-          continue;
-        }
-
-        const alreadyInList = currentClosestNodes.some((node) =>
-          node.id.equals(newNode.id),
-        );
-
-        if (!alreadyInList) {
-          this.routingTable.addNode(newNode);
-
-          currentClosestNodes.push(newNode);
-          foundCloserNodes = true;
-        }
-      }
-
-      if (!foundCloserNodes) {
-        break;
-      }
-
-      currentClosestNodes.sort((a, b) => compareDistances(target, a.id, b.id));
-      currentClosestNodes = currentClosestNodes.slice(0, this.k);
-    }
-
-    return currentClosestNodes;
+    return nodes;
   }
 
   /**
@@ -175,83 +123,31 @@ export class KademliaNode {
       }
     }
 
-    const queriedNodes = new Set<string>();
-    const closestNodes = this.routingTable.findClosestNodes(key, k);
+    const result = await this.iterativeLookup<
+      Uint8Array,
+      { value: Uint8Array | null; closestNodes: DHTNode[] }
+    >(
+      key,
+      (node) => this.queryNodeForValue(node, key),
+      (queryResult) => ({
+        value: queryResult.value,
+        nodes: queryResult.closestNodes,
+      }),
+      {
+        alpha,
+        k,
+        maxIterations,
+      },
+    );
 
-    let currentClosestNodes = [...closestNodes];
-    let iterations = 0;
-
-    while (iterations < maxIterations) {
-      iterations++;
-
-      const nodesToQuery: DHTNode[] = [];
-
-      for (const node of currentClosestNodes) {
-        const nodeIdHex = node.id.toHex();
-
-        if (queriedNodes.has(nodeIdHex)) {
-          continue;
-        }
-
-        nodesToQuery.push(node);
-
-        if (nodesToQuery.length >= alpha) {
-          break;
-        }
-      }
-
-      if (nodesToQuery.length === 0) {
-        break;
-      }
-
-      const results = await Promise.all(
-        nodesToQuery.map((node) => {
-          queriedNodes.add(node.id.toHex());
-
-          return this.queryNodeForValue(node, key);
-        }),
-      );
-
-      for (const result of results) {
-        if (result.value !== null) {
-          this.storage.set(keyHex, {
-            value: result.value,
-            expiresAt: Date.now() + DEFAULT_TTL,
-          });
-
-          return result.value;
-        }
-      }
-
-      let foundCloserNodes = false;
-
-      for (const result of results) {
-        for (const newNode of result.closestNodes) {
-          if (this.nodeId.equals(newNode.id)) {
-            continue;
-          }
-
-          const alreadyInList = currentClosestNodes.some((node) =>
-            node.id.equals(newNode.id),
-          );
-
-          if (!alreadyInList) {
-            this.routingTable.addNode(newNode);
-            currentClosestNodes.push(newNode);
-            foundCloserNodes = true;
-          }
-        }
-      }
-
-      if (!foundCloserNodes) {
-        break;
-      }
-
-      currentClosestNodes.sort((a, b) => compareDistances(key, a.id, b.id));
-      currentClosestNodes = currentClosestNodes.slice(0, k);
+    if (result.value !== null) {
+      this.storage.set(keyHex, {
+        value: result.value,
+        expiresAt: Date.now() + DEFAULT_TTL,
+      });
     }
 
-    return null;
+    return result.value;
   }
 
   addNode(node: DHTNode): DHTNode[] {
@@ -284,5 +180,108 @@ export class KademliaNode {
       );
       return { value: null, closestNodes: [] };
     }
+  }
+
+  private isNodeInList(nodeId: NodeId, list: DHTNode[]): boolean {
+    return list.some((node) => node.id.equals(nodeId));
+  }
+
+  private async iterativeLookup<TValue, TQueryResult>(
+    targetId: NodeId,
+    queryFn: (node: DHTNode) => Promise<TQueryResult>,
+    processResults: (result: TQueryResult) => {
+      value?: TValue | null;
+      nodes: DHTNode[];
+    },
+    options: {
+      alpha: number;
+      k: number;
+      maxIterations: number;
+    },
+  ): Promise<{ value: TValue | null; nodes: DHTNode[] }> {
+    const { alpha, k, maxIterations } = options;
+    const queriedNodes = new Set<string>();
+    const closestNodes = this.routingTable.findClosestNodes(targetId, k);
+
+    let currentClosestNodes = [...closestNodes];
+    let foundValue: TValue | null = null;
+    let iterations = 0;
+
+    while (iterations < maxIterations) {
+      iterations++;
+
+      const nodesToQuery: DHTNode[] = [];
+
+      for (const node of currentClosestNodes) {
+        const nodeIdHex = node.id.toHex();
+
+        if (queriedNodes.has(nodeIdHex)) {
+          continue;
+        }
+
+        nodesToQuery.push(node);
+
+        if (nodesToQuery.length >= alpha) {
+          break;
+        }
+      }
+
+      if (nodesToQuery.length === 0) {
+        break;
+      }
+
+      const results = await Promise.all(
+        nodesToQuery.map((node) => {
+          queriedNodes.add(node.id.toHex());
+          return queryFn(node);
+        }),
+      );
+
+      let foundCloserNodes = false;
+
+      for (const result of results) {
+        const { value, nodes } = processResults(result);
+
+        if (value !== null && value !== undefined) {
+          foundValue = value;
+          break;
+        }
+
+        for (const newNode of nodes) {
+          if (this.nodeId.equals(newNode.id)) {
+            continue;
+          }
+
+          const alreadyInList = this.isNodeInList(
+            newNode.id,
+            currentClosestNodes,
+          );
+
+          if (!alreadyInList) {
+            this.routingTable.addNode(newNode);
+            currentClosestNodes.push(newNode);
+            foundCloserNodes = true;
+          }
+        }
+      }
+
+      if (foundValue !== null) {
+        break;
+      }
+
+      if (!foundCloserNodes) {
+        break;
+      }
+
+      currentClosestNodes.sort((a, b) =>
+        compareDistances(targetId, a.id, b.id),
+      );
+      currentClosestNodes = currentClosestNodes.slice(0, k);
+    }
+
+    return {
+      value: foundValue,
+      nodes: currentClosestNodes,
+    };
   }
 }
