@@ -1,4 +1,4 @@
-import { type NodeId, compareDistances } from "../core";
+import { NodeId, compareDistances } from "../core";
 import { type DHTNode, KBucket } from "./k-bucket";
 
 export type RoutingTableOptions = {
@@ -61,16 +61,17 @@ export class RoutingTable {
       return [];
     }
 
-    // calculate the prefix length of the node ID to determine which bucket to add it to.
     const prefixLength = this.localNodeId.commonPrefixLength(node.id);
-
     const bucket = this.getBucketFromPrefixLength(prefixLength);
-
     const nodesToPing = bucket.addNode(node);
 
     // if the bucket return nodes to ping, consider is full and try to split it
     if (nodesToPing.length > 0) {
-      // TODO: implement bucket splitting
+      if (this.canSplitBucket(bucket)) {
+        this.splitBucket(bucket);
+
+        return this.addNode(node);
+      }
     }
 
     return nodesToPing;
@@ -147,11 +148,87 @@ export class RoutingTable {
 
   /**
    * Get the bucket from a prefix length.
-   * @param _prefixLength Prefix length to get the bucket for
+   * @param prefixLength Prefix length to get the bucket for
    * @returns KBucket for the prefix length
    */
-  private getBucketFromPrefixLength(_prefixLength: number): KBucket {
-    // biome-ignore lint/style/noNonNullAssertion: FIXME: Implement bucket splitting and remove this assertion
-    return this.buckets.get(0)!;
+  private getBucketFromPrefixLength(prefixLength: number): KBucket {
+    if (this.buckets.has(prefixLength)) {
+      return this.buckets.get(prefixLength) as KBucket;
+    }
+
+    const prefix = Array.from(this.buckets.keys()).reduce(
+      (max, bucketPrefix) =>
+        bucketPrefix > max && bucketPrefix <= prefixLength ? bucketPrefix : max,
+      0,
+    );
+
+    return this.buckets.get(prefix) as KBucket;
+  }
+
+  /**
+   * Check if a bucket can be split.
+   * A bucket can be split if:
+   * 1. It contains the range that includes the local node's ID
+   * 2. Splitting would not exceed the maximum bit length
+   * @param bucket
+   * @private
+   */
+  private canSplitBucket(bucket: KBucket): boolean {
+    const prefixLength = this.findBucketPrefixLength(bucket);
+
+    if (prefixLength === undefined) {
+      return false;
+    }
+
+    if (prefixLength >= NodeId.SIZE_IN_BITS - 1) {
+      return false;
+    }
+
+    return Math.max(...this.buckets.keys()) === prefixLength;
+  }
+
+  /**
+   * Split a bucket into two buckets according to Kademlia rules.
+   * This creates two new buckets, one for nodes with a 0 at the next bit position,
+   * and one for nodes with a 1 at the next bit position.
+   *
+   * @param bucket The bucket to split
+   */
+  private splitBucket(bucket: KBucket): void {
+    const prefixLength = this.findBucketPrefixLength(bucket);
+
+    if (prefixLength === undefined) {
+      return;
+    }
+
+    const options = {
+      k: this.k,
+      pingCount: this.pingCount,
+    };
+
+    const bucket0 = new KBucket(this.localNodeId, options);
+    const bucket1 = new KBucket(this.localNodeId, options);
+
+    // Redistribute nodes between the two buckets based on the bit at position bucketPrefix
+    for (const node of bucket.getAllNodes()) {
+      if (node.id.getBit(prefixLength)) {
+        bucket1.addNode(node);
+      } else {
+        bucket0.addNode(node);
+      }
+    }
+
+    this.buckets.delete(prefixLength);
+
+    const localNodeIdBit = this.localNodeId.getBit(prefixLength);
+
+    this.buckets.set(prefixLength + 1, localNodeIdBit ? bucket1 : bucket0);
+    this.buckets.set(prefixLength, localNodeIdBit ? bucket0 : bucket1);
+  }
+
+  private findBucketPrefixLength(bucket: KBucket): number | undefined {
+    return Array.from(this.buckets.entries()).find(
+      ([_, value]) => value === bucket,
+    )?.[0];
   }
 }

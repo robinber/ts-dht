@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createNodeFixture } from "../__fixtures__/createNode.fixture";
 
-import { NodeId } from "../core/node-id";
+import { NodeId } from "../core";
 import { RoutingTable } from "./routing-table";
 
 describe("RoutingTable", () => {
@@ -34,6 +34,147 @@ describe("RoutingTable", () => {
       expect(nodesToPing).toHaveLength(0);
       expect(routingTable.size()).toEqual(0);
       expect(routingTable.findNode(node.id)).toEqual(undefined);
+    });
+
+    it("should split the bucket when it becomes full and contains the local node range", () => {
+      // GIVEN
+      const localNodeId = NodeId.fromHex(
+        "8000000000000000000000000000000000000000",
+      );
+      const routingTable = new RoutingTable(localNodeId, { k: 2 });
+
+      // These will go to the "0..." bucket (opposite of local node)
+      const node1 = createNodeFixture(
+        "0100000000000000000000000000000000000000",
+      );
+      const node2 = createNodeFixture(
+        "0200000000000000000000000000000000000000",
+      );
+
+      // This will go to the "1..." bucket (same as local node)
+      const node3 = createNodeFixture(
+        "9000000000000000000000000000000000000000",
+      );
+
+      routingTable.addNode(node1);
+      routingTable.addNode(node2);
+
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      const bucketsSizeBeforeSplit = (routingTable as any).buckets.size;
+
+      // WHEN
+      const nodesToPing = routingTable.addNode(node3);
+
+      // THEN
+      expect(nodesToPing).toHaveLength(0);
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      expect((routingTable as any).buckets.size).toBe(2);
+      expect(bucketsSizeBeforeSplit).toBe(1);
+      expect(routingTable.findNode(node1.id)).toBeDefined();
+      expect(routingTable.findNode(node2.id)).toBeDefined();
+      expect(routingTable.findNode(node3.id)).toBeDefined();
+    });
+    it("should not split a bucket that doesn't contain the local node range", () => {
+      // GIVEN
+      const localNodeId = NodeId.fromHex(
+        "8000000000000000000000000000000000000000",
+      );
+      const routingTable = new RoutingTable(localNodeId, { k: 2 });
+
+      // Manually create a split situation where we already have both a 0 and 1 prefix bucket
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      const bucket0 = (routingTable as any).buckets.get(0);
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      (routingTable as any).buckets.delete(0);
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      (routingTable as any).buckets.set(0, bucket0); // "0..." prefix bucket
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      (routingTable as any).buckets.set(1, bucket0); // "1..." prefix bucket
+
+      // This bucket contains node IDs starting with "0"
+      const node1 = createNodeFixture(
+        "0100000000000000000000000000000000000000",
+      );
+      const node2 = createNodeFixture(
+        "0200000000000000000000000000000000000000",
+      );
+      const node3 = createNodeFixture(
+        "0300000000000000000000000000000000000000",
+      );
+
+      routingTable.addNode(node1);
+      routingTable.addNode(node2);
+
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      const bucketCountBefore = (routingTable as any).buckets.size;
+
+      // WHEN
+      const nodesToPing = routingTable.addNode(node3);
+
+      // THEN
+      expect(nodesToPing).toHaveLength(2);
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      expect((routingTable as any).buckets.size).toBe(bucketCountBefore);
+      expect(routingTable.findNode(node3.id)).toBeUndefined();
+    });
+
+    it("should support multiple levels of bucket splitting", () => {
+      // GIVEN
+      const localNodeId = NodeId.fromHex(
+        "8000000000000000000000000000000000000000",
+      );
+      const routingTable = new RoutingTable(localNodeId, { k: 2 });
+
+      // First level: "0..." vs "1..."
+      const node1 = createNodeFixture(
+        "0100000000000000000000000000000000000000",
+      );
+      const node2 = createNodeFixture(
+        "0200000000000000000000000000000000000000",
+      );
+
+      // Will cause first split
+      const node3 = createNodeFixture(
+        "9000000000000000000000000000000000000000",
+      );
+
+      // Second level: "10..." vs "11..."
+      const node4 = createNodeFixture(
+        "A000000000000000000000000000000000000000",
+      ); // 10...
+
+      // Will cause second split
+      const node5 = createNodeFixture(
+        "C000000000000000000000000000000000000000",
+      ); // 11...
+
+      // WHEN - First split
+      routingTable.addNode(node1);
+      routingTable.addNode(node2);
+      routingTable.addNode(node3);
+
+      // Should have 2 buckets now
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      const bucketCountAfterFirstSplit = (routingTable as any).buckets.size;
+
+      // WHEN - Second split
+      routingTable.addNode(node4);
+      routingTable.addNode(node5);
+
+      // THEN
+      // Should have 3 buckets now (prefix 0, prefix 10, prefix 11)
+      // biome-ignore lint/suspicious/noExplicitAny: this is only for testing
+      const bucketCountAfterSecondSplit = (routingTable as any).buckets.size;
+
+      expect(bucketCountAfterFirstSplit).toBe(2);
+      expect(bucketCountAfterSecondSplit).toBe(3);
+
+      // All nodes should be in the routing table
+      expect(routingTable.findNode(node1.id)).toBeDefined();
+      expect(routingTable.findNode(node2.id)).toBeDefined();
+      expect(routingTable.findNode(node3.id)).toBeDefined();
+      expect(routingTable.findNode(node4.id)).toBeDefined();
+      expect(routingTable.findNode(node5.id)).toBeDefined();
     });
   });
 
