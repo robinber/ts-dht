@@ -1,10 +1,11 @@
-name: CI
+name: CI Test and Validation
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch: # Allow manual triggering
 
 jobs:
   verify:
@@ -14,6 +15,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for PR checks
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -49,4 +52,16 @@ jobs:
         run: pnpm build --noEmit
 
       - name: Run tests
+        id: tests
         run: pnpm test
+      
+      # Report test status to PR
+      - name: Report test status
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          if [ "${{ steps.tests.outcome }}" == "success" ]; then
+            echo "Tests passed successfully! ✅"
+          else
+            echo "Tests failed! ❌"
+            exit 1
+          fi
