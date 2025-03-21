@@ -1,0 +1,38 @@
+# Repository settings managed by Probot Settings: https://probot.github.io/apps/settings/
+# This file defines the repository settings and branch protection rules
+
+repository:
+  # Repository name and description are typically managed through GitHub UI
+  # These settings enforce rules about pull requests and code checks
+
+  # Enable vulnerability alerts
+  enable_vulnerability_alerts: true
+  
+  # Enable automated security fixes
+  enable_automated_security_fixes: true
+
+  # General repository settings
+  allow_squash_merge: true
+  allow_merge_commit: true
+  allow_rebase_merge: true
+  delete_branch_on_merge: true  # Automatically delete head branches after merging
+
+# Branch protection rules
+branches:
+  - name: master
+    protection:
+      required_status_checks:
+        # Require status checks to pass before merging
+        strict: true  # PR branch must be up-to-date with base branch
+        contexts:
+          - "Verify Code"  # This is the name of your job in the GitHub workflow
+
+      # Require a pull request before merging
+      required_pull_request_reviews:
+        dismiss_stale_reviews: true  # New commits dismiss old reviews
+        require_code_owner_reviews: false  # Optional: set to true if you have CODEOWNERS file
+        required_approving_review_count: 1  # At least one approved review required
+
+      # Additional protection rules
+      enforce_admins: false  # Let admins bypass branch protection rules if needed
+      restrictions: null  # No restrictions on who can push to this branch
