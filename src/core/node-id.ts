@@ -91,12 +91,14 @@ export class NodeId {
   static fromBase58(base58String: string): NodeId {
     // Decode the Base58 string to bytes
     const bytes = bs58.decode(base58String);
-    
+
     // Check if the decoded bytes match the expected size
     if (bytes.length !== NodeId.SIZE_IN_BYTES) {
-      throw new Error(`Invalid Base58 string: expected ${NodeId.SIZE_IN_BYTES} bytes but got ${bytes.length}`);
+      throw new Error(
+        `Invalid Base58 string: expected ${NodeId.SIZE_IN_BYTES} bytes but got ${bytes.length}`,
+      );
     }
-    
+
     return new NodeId(bytes);
   }
 
