@@ -1,4 +1,5 @@
 import { NodeId, calculateScalarDistance, compareDistances } from "../core";
+import type { NodeLocator } from "./node-locator";
 
 export type DHTNode = {
   id: NodeId;
@@ -33,7 +34,7 @@ export type KBucketOptions = {
   keepSorted?: boolean;
 };
 
-export class KBucket {
+export class KBucket implements NodeLocator {
   // Default k value as specified in the Kademlia paper
   private static readonly DEFAULT_K = 20 as const;
 
