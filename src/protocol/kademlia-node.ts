@@ -1,10 +1,25 @@
 import { NodeId } from "../core";
+import {
+  CircuitBreakerOpenError,
+  KademliaError,
+  NodeTimeoutError,
+  StoreError,
+  UnreliableNodeError,
+} from "../errors/kademlia-errors";
 import { type DHTNode, RoutingTable } from "../routing";
+import {
+  CircuitBreaker,
+  type CircuitBreakerSate,
+  NodeContextOperationEnum,
+  createNodeContext,
+} from "../utils/circuit-breaker";
+import { type RetryOptions, withRetry } from "../utils/retry";
 import {
   DEFAULT_ALPHA,
   DEFAULT_EXPIRE_INTERVAL,
   DEFAULT_K,
   DEFAULT_MAX_ITERATIONS,
+  DEFAULT_RCP_TIMEOUT,
   DEFAULT_REPUBLISH_INTERVAL,
   DEFAULT_TTL,
 } from "./kademlia-node.constants";
@@ -36,6 +51,11 @@ export class KademliaNode {
   private readonly republishInterval: number;
   private readonly expireInterval: number;
   private readonly maxIterations: number;
+  private readonly rpcTimeout: number;
+
+  // Error handling
+  private readonly retryOptions: Partial<RetryOptions>;
+  private readonly circuitBreaker: CircuitBreaker;
 
   // Periodic maintenance
   private republishTimer: NodeJS.Timeout | null = null;
@@ -69,6 +89,7 @@ export class KademliaNode {
       // @ts-ignore
       this.stats[key] = value;
     },
+    getCircuitBreaker: () => this.circuitBreaker,
   };
 
   // Statistics
@@ -86,6 +107,10 @@ export class KademliaNode {
     messagesReceived: 0,
     startTime: Date.now(),
     uptime: 0,
+    totalErrors: 0,
+    timeoutErrors: 0,
+    circuitBreakerTrips: 0,
+    totalRetries: 0,
   };
 
   // Lookup tracking for debugging
@@ -117,6 +142,34 @@ export class KademliaNode {
       options.republishInterval ?? DEFAULT_REPUBLISH_INTERVAL;
     this.expireInterval = options.expireInterval ?? DEFAULT_EXPIRE_INTERVAL;
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+    this.rpcTimeout = options.rpcTimeout ?? DEFAULT_RCP_TIMEOUT;
+
+    // Initialize retry options
+    this.retryOptions = {
+      maxAttempts: 3,
+      initialDelay: 100,
+      maxDelay: 5000,
+      backoffFactor: 2,
+      jitter: 0.1,
+      ...options.retryOptions,
+      // Track retries for statistics
+      onRetry: (attempt, delay, error) => {
+        this.stats.totalRetries++;
+        options.retryOptions?.onRetry?.(attempt, delay, error);
+      },
+    };
+
+    // Initialize circuit breaker
+    this.circuitBreaker = new CircuitBreaker({
+      failureThreshold: options.circuitBreakerOptions?.failureThreshold ?? 5,
+      resetTimeout: options.circuitBreakerOptions?.resetTimeout ?? 30_000,
+      isFailure: (error) => {
+        return (
+          error instanceof NodeTimeoutError ||
+          error instanceof UnreliableNodeError
+        );
+      },
+    });
 
     // Create routing table
     this.routingTable = new RoutingTable(nodeId, {
@@ -149,17 +202,54 @@ export class KademliaNode {
       return false;
     }
 
+    const nodeIdHex = targetNodeId.toHex();
+    const context = createNodeContext(nodeIdHex, NodeContextOperationEnum.PING);
+
     try {
-      // TODO: Implement actual RPC ping
-      // For now, we'll simulate a successful ping
-      this.stats.messagesSent++;
-      this.stats.messagesReceived++;
+      if (this.circuitBreaker.isOpen(context)) {
+        this.stats.circuitBreakerTrips++;
+
+        return false;
+      }
+
+      const result = await this.circuitBreaker.execute(async () => {
+        const pingResult = await withRetry(async () => {
+          // Simulate a network operation with timeout
+          const pingPromise = this.sendPingRPC(node);
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => {
+              reject(
+                new NodeTimeoutError(
+                  "Ping timed out",
+                  NodeContextOperationEnum.PING,
+                ),
+              );
+            }, this.rpcTimeout);
+          });
+
+          return Promise.race([pingPromise, timeoutPromise]);
+        }, this.retryOptions);
+
+        if (!pingResult.successful) {
+          throw pingResult.lastError;
+        }
+
+        return pingResult.result;
+      }, context);
 
       // Update the node's last seen timestamp in the routing table
       this.routingTable.updateNodeTimestamp(targetNodeId);
-      return true;
+
+      return result;
     } catch (error) {
-      console.error(`Failed to ping node ${targetNodeId.toHex()}:`, error);
+      this.stats.totalErrors++;
+
+      if (error instanceof NodeTimeoutError) {
+        this.stats.timeoutErrors++;
+      } else if (error instanceof CircuitBreakerOpenError) {
+        this.stats.circuitBreakerTrips++;
+      }
+
       return false;
     }
   }
@@ -170,6 +260,7 @@ export class KademliaNode {
    * @param value The value to store (binary data)
    * @param ttl Optional time-to-live in milliseconds
    * @returns Promise resolving to true if storage was successful
+   * @throws StoreError if the operation fails
    */
   async store(key: NodeId, value: Uint8Array, ttl?: number): Promise<boolean> {
     const keyHex = key.toHex();
@@ -189,35 +280,84 @@ export class KademliaNode {
     this.stats.storageSize += value.length;
     this.stats.valuesStored++;
 
-    // Find the k closest nodes to the key
-    const closestNodes = await this.findNode(key);
+    try {
+      // Find the k closest nodes to the key
+      const closestNodes = await this.findNode(key);
 
-    // Store on remote nodes
-    const storePromises = closestNodes.map(async (node) => {
-      if (node.id.equals(this.nodeId)) {
-        return true; // Skip self
+      // Store on remote nodes with controlled concurrency
+      const storePromises = closestNodes.map((node) => {
+        if (node.id.equals(this.nodeId)) {
+          return async () => true; // Skip self
+        }
+
+        return async () => {
+          const nodeIdHex = node.id.toHex();
+          const context = createNodeContext(
+            nodeIdHex,
+            NodeContextOperationEnum.STORE,
+          );
+
+          // Skip if circuit breaker is open
+          if (this.circuitBreaker.isOpen(context)) {
+            this.stats.circuitBreakerTrips++;
+            return false;
+          }
+
+          try {
+            return await this.circuitBreaker.execute(async () => {
+              const storeResult = await withRetry(async () => {
+                // Simulation of actual store RPC
+                const storePromise = this.sendStoreRPC(
+                  node,
+                  key,
+                  value,
+                  actualTtl,
+                );
+                const timeoutPromise = new Promise<never>((_, reject) => {
+                  setTimeout(() => {
+                    reject(new NodeTimeoutError(nodeIdHex, "store"));
+                  }, this.rpcTimeout);
+                });
+
+                return Promise.race([storePromise, timeoutPromise]);
+              }, this.retryOptions);
+
+              if (!storeResult.successful) {
+                throw storeResult.lastError;
+              }
+
+              return storeResult.result;
+            }, context);
+          } catch (error) {
+            this.stats.totalErrors++;
+
+            if (error instanceof CircuitBreakerOpenError) {
+              this.stats.circuitBreakerTrips++;
+            } else if (error instanceof NodeTimeoutError) {
+              this.stats.timeoutErrors++;
+            }
+
+            return false;
+          }
+        };
+      });
+
+      // Execute store operations with concurrency control
+      const results = await Promise.all(storePromises.map((fn) => fn()));
+
+      // Return true if at least one remote store succeeded (plus we already stored locally)
+      const remoteSuccess = results.some((result) => result);
+      return remoteSuccess || true;
+    } catch (error) {
+      // Even if remote storage fails, we've stored locally
+      if (error instanceof KademliaError) {
+        throw error;
       }
-
-      try {
-        // TODO: Implement actual RPC store operation
-        // For now just simulating network activity
-        this.stats.messagesSent++;
-        return true;
-      } catch (error) {
-        console.error(
-          `Failed to store value at node ${node.id.toHex()}:`,
-          error,
-        );
-        return false;
-      }
-    });
-
-    // Wait for all store operations to complete
-    const results = await Promise.all(storePromises);
-
-    // Return true if at least one remote store succeeded
-    // (plus we already stored locally)
-    return results.some((result) => result) || true;
+      throw new StoreError(
+        keyHex,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   /**
@@ -226,38 +366,65 @@ export class KademliaNode {
    * @param target NodeId to find nodes closest to
    * @param lookupId Optional ID for tracking the lookup operation
    * @returns Array of nodes returned by the target
+   * @throws NodeTimeoutError if the node doesn't respond in time
    */
   async queryNode(
     node: DHTNode,
     target: NodeId,
     lookupId?: string,
   ): Promise<DHTNode[]> {
+    const nodeIdHex = node.id.toHex();
+    const context = createNodeContext(
+      nodeIdHex,
+      NodeContextOperationEnum.FIND_NODE,
+    );
+
+    // Track the node as contacted for this lookup
+    if (lookupId) {
+      const request = this.activeRequests.get(lookupId);
+      if (request) {
+        request.contacted.add(nodeIdHex);
+      }
+    }
+
+    // Skip if circuit breaker is open
+    if (this.circuitBreaker.isOpen(context)) {
+      this.stats.circuitBreakerTrips++;
+      return [];
+    }
+
     try {
-      // Track the node as contacted for this lookup
-      if (lookupId) {
-        const request = this.activeRequests.get(lookupId);
-        if (request) {
-          request.contacted.add(node.id.toHex());
+      return await this.circuitBreaker.execute(async () => {
+        const queryResult = await withRetry(async () => {
+          // Actual RPC call with timeout
+          const queryPromise = this.sendFindNodeRPC(node, target);
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => {
+              reject(new NodeTimeoutError(nodeIdHex, "findNode"));
+            }, this.rpcTimeout);
+          });
+
+          return Promise.race([queryPromise, timeoutPromise]);
+        }, this.retryOptions);
+
+        if (!queryResult.successful) {
+          throw queryResult.lastError;
         }
+
+        // Update the node's last seen timestamp
+        this.routingTable.updateNodeTimestamp(node.id);
+
+        return queryResult.result;
+      }, context);
+    } catch (error) {
+      this.stats.totalErrors++;
+
+      if (error instanceof CircuitBreakerOpenError) {
+        this.stats.circuitBreakerTrips++;
+      } else if (error instanceof NodeTimeoutError) {
+        this.stats.timeoutErrors++;
       }
 
-      this.stats.messagesSent++;
-
-      // TODO: Implement the actual RPC call
-      // 1. Serialize the request
-      // 2. Send it to the node using its address
-      // 3. Wait for and parse the response
-      // 4. Return the nodes from the response
-
-      // For now simulate a successful response with empty results
-      this.stats.messagesReceived++;
-
-      // Update the node's last seen timestamp
-      this.routingTable.updateNodeTimestamp(node.id);
-
-      return [];
-    } catch (error) {
-      console.error(`Failed to query node ${node.id.toHex()}:`, error);
       return [];
     }
   }
@@ -422,39 +589,70 @@ export class KademliaNode {
    * @param key Key to look for
    * @param lookupId Optional ID for tracking the lookup operation
    * @returns Object containing the value if found, and closest nodes otherwise
+   * @throws NodeTimeoutError if the node doesn't respond in time
    */
   async queryNodeForValue(
     node: DHTNode,
     key: NodeId,
     lookupId?: string,
   ): Promise<{ value: Uint8Array | null; closestNodes: DHTNode[] }> {
+    const nodeIdHex = node.id.toHex();
+    const context = createNodeContext(
+      nodeIdHex,
+      NodeContextOperationEnum.FIND_VALUE,
+    );
+
+    // Track the node as contacted for this lookup
+    if (lookupId) {
+      const request = this.activeRequests.get(lookupId);
+      if (request) {
+        request.contacted.add(nodeIdHex);
+      }
+    }
+
+    // Skip if circuit breaker is open
+    if (this.circuitBreaker.isOpen(context)) {
+      this.stats.circuitBreakerTrips++;
+      return { value: null, closestNodes: [] };
+    }
+
     try {
-      // Track the node as contacted for this lookup
-      if (lookupId) {
-        const request = this.activeRequests.get(lookupId);
-        if (request) {
-          request.contacted.add(node.id.toHex());
+      return await this.circuitBreaker.execute(async () => {
+        const queryResult = await withRetry(async () => {
+          // Actual RPC call with timeout
+          const queryPromise = this.sendFindValueRPC(node, key);
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => {
+              reject(
+                new NodeTimeoutError(
+                  nodeIdHex,
+                  NodeContextOperationEnum.FIND_VALUE,
+                ),
+              );
+            }, this.rpcTimeout);
+          });
+
+          return Promise.race([queryPromise, timeoutPromise]);
+        }, this.retryOptions);
+
+        if (!queryResult.successful) {
+          throw queryResult.lastError;
         }
+
+        // Update the node's last seen timestamp
+        this.routingTable.updateNodeTimestamp(node.id);
+
+        return queryResult.result;
+      }, context);
+    } catch (error) {
+      this.stats.totalErrors++;
+
+      if (error instanceof CircuitBreakerOpenError) {
+        this.stats.circuitBreakerTrips++;
+      } else if (error instanceof NodeTimeoutError) {
+        this.stats.timeoutErrors++;
       }
 
-      this.stats.messagesSent++;
-
-      // TODO: Implement the actual RPC call
-      // 1. Send a FIND_VALUE RPC to the node
-      // 2. The node would check its local storage for the key
-      // 3. If found, it would return the value
-      // 4. If not found, it would return its k closest nodes to the key
-
-      // Update the node's last seen timestamp
-      this.routingTable.updateNodeTimestamp(node.id);
-      this.stats.messagesReceived++;
-
-      return { value: null, closestNodes: [] };
-    } catch (error) {
-      console.error(
-        `Failed to query node ${node.id.toHex()} for value:`,
-        error,
-      );
       return { value: null, closestNodes: [] };
     }
   }
@@ -481,8 +679,8 @@ export class KademliaNode {
     }, this.expireInterval);
 
     // Republish values
-    this.republishTimer = setInterval(() => {
-      this.republishValues();
+    this.republishTimer = setInterval(async () => {
+      await this.republishValues();
     }, this.republishInterval / 10); // Check more frequently than the actual interval
   }
 
@@ -527,12 +725,43 @@ export class KademliaNode {
         randomId = new NodeId(idBytes);
       }
 
-      // Perform a findNode to refresh this bucket
-      await this.findNode(randomId);
+      try {
+        // Perform a findNode to refresh this bucket
+        await this.findNode(randomId);
 
-      // Mark the bucket as refreshed
-      this.routingTable.markBucketAsRefreshed(bucketIndex);
+        // Mark the bucket as refreshed
+        this.routingTable.markBucketAsRefreshed(bucketIndex);
+      } catch (error) {
+        console.error(`Error refreshing bucket ${bucketIndex}:`, error);
+      }
     }
+  }
+
+  /**
+   * Reset the circuit breaker for a specific node
+   * @param nodeId Node ID to reset
+   * @param operation Optional operation name
+   */
+  resetCircuitBreaker(
+    nodeId: NodeId,
+    operation?: NodeContextOperationEnum,
+  ): void {
+    const context = createNodeContext(nodeId.toHex(), operation);
+    this.circuitBreaker.reset(context);
+  }
+
+  /**
+   * Get the current circuit breaker state for a node
+   * @param nodeId Node ID to check
+   * @param operation Optional operation name
+   * @returns Current circuit state
+   */
+  getCircuitBreakerState(
+    nodeId: NodeId,
+    operation?: NodeContextOperationEnum,
+  ): CircuitBreakerSate {
+    const context = createNodeContext(nodeId.toHex(), operation);
+    return this.circuitBreaker.getState(context);
   }
 
   /**
@@ -618,5 +847,84 @@ export class KademliaNode {
         (this.stats.successfulLookups + 1);
       this.activeRequests.delete(lookupId);
     }
+  }
+
+  /**
+   * Send an actual PING RPC (to be implemented with real network code)
+   * @param node Node to ping
+   * @returns Promise resolving to true if successful
+   */
+  private async sendPingRPC(node: DHTNode): Promise<boolean> {
+    console.log("Ping RPC", node);
+
+    // TODO: Implement actual RPC ping
+    // For now, we'll simulate a successful ping
+    this.stats.messagesSent++;
+    this.stats.messagesReceived++;
+
+    return true;
+  }
+
+  /**
+   * Send a STORE RPC (to be implemented with real network code)
+   * @param node Target node
+   * @param key Key to store
+   * @param value Value to store
+   * @param ttl Time to live in milliseconds
+   * @returns Promise resolving to true if successful
+   */
+  private async sendStoreRPC(
+    node: DHTNode,
+    key: NodeId,
+    value: Uint8Array,
+    ttl: number,
+  ): Promise<boolean> {
+    console.log("Store RPC", node, key, value, ttl);
+
+    // TODO: Implement actual RPC store
+    // For now just simulating network activity
+    this.stats.messagesSent++;
+    this.stats.messagesReceived++;
+
+    return true;
+  }
+
+  /**
+   * Send a FIND_NODE RPC (to be implemented with real network code)
+   * @param node Target node
+   * @param target Target ID to find nodes for
+   * @returns Promise resolving to array of nodes
+   */
+  private async sendFindNodeRPC(
+    node: DHTNode,
+    target: NodeId,
+  ): Promise<DHTNode[]> {
+    console.log("FindNodeRPC", node, target);
+
+    // TODO: Implement the actual RPC call
+    // For now simulate a successful response with empty results
+    this.stats.messagesSent++;
+    this.stats.messagesReceived++;
+
+    return [];
+  }
+
+  /**
+   * Send a FIND_VALUE RPC (to be implemented with real network code)
+   * @param node Target node
+   * @param key Key to find
+   * @returns Promise resolving to value or closest nodes
+   */
+  private async sendFindValueRPC(
+    node: DHTNode,
+    key: NodeId,
+  ): Promise<{ value: Uint8Array | null; closestNodes: DHTNode[] }> {
+    console.log("FindValueRPC", node, key);
+
+    // TODO: Implement the actual RPC call
+    this.stats.messagesSent++;
+    this.stats.messagesReceived++;
+
+    return { value: null, closestNodes: [] };
   }
 }

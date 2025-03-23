@@ -1,5 +1,5 @@
-import { NodeId } from "../core/node-id";
-import type { DHTNode } from "../routing/k-bucket";
+import { NodeId } from "../core";
+import type { DHTNode } from "../routing";
 
 export function createNodeFixture(hex: string): DHTNode {
   return {

@@ -1,3 +1,6 @@
+import type { CircuitBreakerOptions } from "../utils/circuit-breaker";
+import type { RetryOptions } from "../utils/retry";
+
 /**
  * Data structure for stored values in the DHT
  */
@@ -11,7 +14,7 @@ export type StoreValue = {
 /**
  * Configuration options for a Kademlia node
  */
-export type KademliaNodeOptions = {
+export interface KademliaNodeOptions {
   /**
    * Network address in the format "ip:port"
    */
@@ -51,7 +54,22 @@ export type KademliaNodeOptions = {
    * Whether to enable automated maintenance tasks (default: true)
    */
   enableMaintenance?: boolean;
-};
+
+  /**
+   * Retry options for network operations
+   */
+  retryOptions?: Partial<RetryOptions>;
+
+  /**
+   * Maximum timeout for RCP operations in milliseconds
+   */
+  rpcTimeout?: number;
+
+  /**
+   * Circuit breaker options
+   */
+  circuitBreakerOptions?: Partial<Omit<CircuitBreakerOptions, "isFailure">>;
+}
 
 /**
  * Lookup types for different Kademlia operations
@@ -92,4 +110,12 @@ export type NodeStats = {
   // Uptime
   startTime: number;
   uptime: number;
+
+  // Error stats
+  totalErrors: number;
+  timeoutErrors: number;
+
+  // Circuit breaker stats
+  circuitBreakerTrips: number;
+  totalRetries: number;
 };
