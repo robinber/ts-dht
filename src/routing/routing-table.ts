@@ -5,6 +5,7 @@ import {
   log2Distance,
 } from "../core";
 import { type DHTNode, KBucket } from "./k-bucket";
+import type { NodeLocator } from "./node-locator";
 
 export type RoutingTableOptions = {
   /**
@@ -30,7 +31,7 @@ export type RoutingTableOptions = {
  * the routing table is a binary tree of k-buckets, where each bucket is a list of nodes
  * with a specific range of XOR distances from the local node.
  */
-export class RoutingTable {
+export class RoutingTable implements NodeLocator {
   // id of the local node
   private readonly localNodeId: NodeId;
 
