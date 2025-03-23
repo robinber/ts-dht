@@ -9,7 +9,6 @@ import {
 import { type DHTNode, RoutingTable } from "../routing";
 import {
   CircuitBreaker,
-  type CircuitBreakerSate,
   NodeContextOperationEnum,
   createNodeContext,
 } from "../utils/circuit-breaker";
@@ -89,7 +88,6 @@ export class KademliaNode {
       // @ts-ignore
       this.stats[key] = value;
     },
-    getCircuitBreaker: () => this.circuitBreaker,
   };
 
   // Statistics
@@ -735,33 +733,6 @@ export class KademliaNode {
         console.error(`Error refreshing bucket ${bucketIndex}:`, error);
       }
     }
-  }
-
-  /**
-   * Reset the circuit breaker for a specific node
-   * @param nodeId Node ID to reset
-   * @param operation Optional operation name
-   */
-  resetCircuitBreaker(
-    nodeId: NodeId,
-    operation?: NodeContextOperationEnum,
-  ): void {
-    const context = createNodeContext(nodeId.toHex(), operation);
-    this.circuitBreaker.reset(context);
-  }
-
-  /**
-   * Get the current circuit breaker state for a node
-   * @param nodeId Node ID to check
-   * @param operation Optional operation name
-   * @returns Current circuit state
-   */
-  getCircuitBreakerState(
-    nodeId: NodeId,
-    operation?: NodeContextOperationEnum,
-  ): CircuitBreakerSate {
-    const context = createNodeContext(nodeId.toHex(), operation);
-    return this.circuitBreaker.getState(context);
   }
 
   /**
