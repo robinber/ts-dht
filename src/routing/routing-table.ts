@@ -1,9 +1,4 @@
-import {
-  NodeId,
-  calculateScalarDistance,
-  compareDistances,
-  log2Distance,
-} from "../core";
+import { NodeId, calculateScalarDistance, log2Distance } from "../core";
 import { type DHTNode, KBucket } from "./k-bucket";
 import type { NodeLocator } from "./node-locator";
 
@@ -131,23 +126,108 @@ export class RoutingTable implements NodeLocator {
    * @param targetId Target NodeId
    * @param count Maximum number of nodes to return
    * @returns List of k closest nodes to the target NodeId
+   * @TODO: Optimize this method with a max heap instead of sorting the array
    */
   findClosestNodes(targetId: NodeId, count = this.k): DHTNode[] {
-    // If the target is the local node, optimization is possible
-    if (targetId.equals(this.localNodeId)) {
-      // With sorted buckets, we can just take nodes from nearest buckets first
-      if (this.keepBucketsSorted) {
-        return this.getNodesFromNearestBuckets(count);
+    // Special case: if target is our own nodeId and buckets are sorted
+    if (targetId.equals(this.localNodeId) && this.keepBucketsSorted) {
+      return this.getNodesFromNearestBuckets(count);
+    }
+
+    // Calculate log2Distance between our node and the target
+    // This gives us the most relevant bucket to examine first
+    const targetBucketIndex = log2Distance(targetId, this.localNodeId);
+
+    // Create a min-heap to maintain the k closest nodes
+    const closestNodes: { distance: bigint; node: DHTNode }[] = [];
+    const addedNodeIds = new Set<string>();
+
+    // Create a priority queue of buckets to examine, starting with the most relevant
+    const bucketQueue: { index: number; minDistance: bigint }[] = [];
+
+    // Add the most relevant bucket to the queue
+    if (targetBucketIndex >= 0) {
+      bucketQueue.push({
+        index: targetBucketIndex,
+        minDistance: 1n << BigInt(targetBucketIndex),
+      });
+    }
+
+    // Function to add a bucket to the priority queue
+    const enqueueBucket = (index: number) => {
+      if (this.buckets.has(index)) {
+        const minDistance = 1n << BigInt(index);
+        bucketQueue.push({ index, minDistance });
+      }
+    };
+
+    // If the most relevant bucket doesn't exist, add the closest existing buckets
+    if (targetBucketIndex < 0 || !this.buckets.has(targetBucketIndex)) {
+      // Iterate through all buckets to find the most relevant ones
+      for (const index of this.buckets.keys()) {
+        enqueueBucket(index);
       }
     }
 
-    // Get all nodes and sort them by distance to the target
-    const allNodes = this.getAllNodes();
-    const sortedNodes = [...allNodes].sort((a, b) =>
-      compareDistances(targetId, a.id, b.id),
-    );
+    // Sort buckets by minimum distance
+    bucketQueue.sort((a, b) => Number(a.minDistance - b.minDistance));
 
-    return sortedNodes.slice(0, count);
+    // Process buckets in order of relevance
+    while (bucketQueue.length > 0 && closestNodes.length < count) {
+      const bucketItem = bucketQueue.shift();
+      if (!bucketItem) continue;
+
+      const { index } = bucketItem;
+      const bucket = this.buckets.get(index);
+
+      if (!bucket) continue;
+
+      // Examine all nodes in this bucket
+      for (const node of bucket.getAllNodes()) {
+        const nodeIdHex = node.id.toHex();
+
+        // Avoid duplicates
+        if (addedNodeIds.has(nodeIdHex)) continue;
+
+        // Calculate distance
+        const distance = calculateScalarDistance(targetId, node.id);
+
+        // If we don't have k nodes yet, add this node
+        if (closestNodes.length < count) {
+          closestNodes.push({ distance, node });
+          addedNodeIds.add(nodeIdHex);
+
+          // Reorganize the heap if necessary
+          closestNodes.sort((a, b) => Number(b.distance - a.distance));
+        }
+        // Otherwise, check if this node is closer than the farthest in our list
+        else if (distance < closestNodes[0].distance) {
+          // Remove the farthest node
+          const removedNode = closestNodes.shift();
+          if (removedNode) {
+            addedNodeIds.delete(removedNode.node.id.toHex());
+          }
+
+          // Add this new closer node
+          closestNodes.push({ distance, node });
+          addedNodeIds.add(nodeIdHex);
+
+          // Reorganize the heap
+          closestNodes.sort((a, b) => Number(b.distance - a.distance));
+        }
+      }
+
+      // If we already have k nodes, check if we can prune other buckets
+      if (closestNodes.length >= count) {
+        const farthestDistance = closestNodes[0].distance;
+
+        // Filter out buckets whose minimum distance is greater than our farthest node
+        bucketQueue.filter((item) => item.minDistance < farthestDistance);
+      }
+    }
+
+    // Extract nodes in order (from closest to farthest)
+    return closestNodes.reverse().map((item) => item.node);
   }
 
   /**
@@ -218,14 +298,6 @@ export class RoutingTable implements NodeLocator {
   }
 
   /**
-   * Get the buckets in the routing table
-   * @returns Map of buckets
-   */
-  getBuckets(): Map<number, KBucket> {
-    return this.buckets;
-  }
-
-  /**
    * Get statistics about the routing table
    * @returns Routing table statistics
    */
@@ -286,7 +358,7 @@ export class RoutingTable implements NodeLocator {
     }
 
     // Find the closest bucket prefix that covers this index
-    // Look for bucket with longest matching prefix
+    // Look for bucket with the longest matching prefix
     let bestPrefix = 0;
 
     for (const prefix of this.buckets.keys()) {
