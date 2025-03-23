@@ -217,6 +217,14 @@ export class RoutingTable {
   }
 
   /**
+   * Get the buckets in the routing table
+   * @returns Map of buckets
+   */
+  getBuckets(): Map<number, KBucket> {
+    return this.buckets;
+  }
+
+  /**
    * Get statistics about the routing table
    * @returns Routing table statistics
    */
