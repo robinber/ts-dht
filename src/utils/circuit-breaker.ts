@@ -129,7 +129,7 @@ export class CircuitBreaker {
     const now = Date.now();
 
     if (internalState === CircuitBreakerSate.OPEN) {
-      if (now < Date.now()) {
+      if (now < nextAttempt) {
         throw new CircuitBreakerOpenError(
           "Circuit is open",
           new Date(nextAttempt),
@@ -137,7 +137,7 @@ export class CircuitBreaker {
       }
 
       // Move to half-open state for testing
-      internalState = CircuitBreakerSate.OPEN;
+      internalState = CircuitBreakerSate.HALF_OPEN;
     }
 
     try {
