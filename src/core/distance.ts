@@ -61,14 +61,36 @@ export function compareDistances(
  */
 export function calculateScalarDistance(a: NodeId, b: NodeId): bigint {
   const distance = calculateDistance(a, b);
-  let result = 0n;
+  const byteLength = distance.length;
 
-  // Convert byte array to BigInt
-  for (const byte of distance) {
-    result = (result << 8n) | BigInt(byte);
+  // Find the first non-zero byte to optimize calculation
+  for (let i = 0; i < byteLength; i++) {
+    if (distance[i] !== 0) {
+      // Optimize with a fast path for common sizes
+      if (i === 0) {
+        // Process all bytes at once when possible
+        if (byteLength <= 6) {
+          // For up to 6 bytes (48 bits), we can use Number
+          // which is significantly faster than BigInt operations
+          let result = 0;
+          for (let j = 0; j < byteLength; j++) {
+            result = (result << 8) | distance[j];
+          }
+          return BigInt(result);
+        }
+      }
+
+      // Process remaining bytes with BigInt for larger values
+      let result = 0n;
+      for (let j = i; j < byteLength; j++) {
+        result = (result << 8n) | BigInt(distance[j]);
+      }
+      return result;
+    }
   }
 
-  return result;
+  // All bytes are zero, return zero (nodes are identical)
+  return 0n;
 }
 
 /**
