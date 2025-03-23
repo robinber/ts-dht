@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createNodeFixture } from "../__fixtures__/createNode.fixture";
 import { NodeId } from "../core";
 import type { DHTNode } from "../routing";
-import { KademliaNode, type StoreValue } from "./kademlia-node";
+import { KademliaNode } from "./kademlia-node";
+import type { StoreValue } from "./kademlia-node.types";
 
 describe("KademliaNode", () => {
   let localNode: KademliaNode;
