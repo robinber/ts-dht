@@ -1,6 +1,7 @@
 import { NodeId, calculateScalarDistance, log2Distance } from "../core";
 import { type DHTNode, KBucket } from "./k-bucket";
 import type { NodeLocator } from "./node-locator";
+import { MaxHeap } from "../utils/max-heap";
 
 export type RoutingTableOptions = {
   /**
@@ -122,11 +123,10 @@ export class RoutingTable implements NodeLocator {
 
   /**
    * Find the k closest nodes to a target NodeId.
-   * Uses optimized distance calculations and bucket structure for efficiency.
+   * Uses a binary heap implementation for efficient node selection.
    * @param targetId Target NodeId
    * @param count Maximum number of nodes to return
    * @returns List of k closest nodes to the target NodeId
-   * @TODO: Optimize this method with a max heap instead of sorting the array
    */
   findClosestNodes(targetId: NodeId, count = this.k): DHTNode[] {
     // Special case: if target is our own nodeId and buckets are sorted
@@ -138,96 +138,92 @@ export class RoutingTable implements NodeLocator {
     // This gives us the most relevant bucket to examine first
     const targetBucketIndex = log2Distance(targetId, this.localNodeId);
 
-    // Create a min-heap to maintain the k closest nodes
-    const closestNodes: { distance: bigint; node: DHTNode }[] = [];
-    const addedNodeIds = new Set<string>();
+    // Create a max heap to efficiently maintain the k closest nodes
+    const maxHeap = new MaxHeap<DHTNode>((node) => node.id.toHex());
 
-    // Create a priority queue of buckets to examine, starting with the most relevant
+    // Create an efficient priority queue for buckets to examine
     const bucketQueue: { index: number; minDistance: bigint }[] = [];
+    const processedBuckets = new Set<number>();
 
     // Add the most relevant bucket to the queue
-    if (targetBucketIndex >= 0) {
+    if (targetBucketIndex >= 0 && this.buckets.has(targetBucketIndex)) {
       bucketQueue.push({
         index: targetBucketIndex,
         minDistance: 1n << BigInt(targetBucketIndex),
       });
-    }
-
-    // Function to add a bucket to the priority queue
-    const enqueueBucket = (index: number) => {
-      if (this.buckets.has(index)) {
-        const minDistance = 1n << BigInt(index);
-        bucketQueue.push({ index, minDistance });
-      }
-    };
-
-    // If the most relevant bucket doesn't exist, add the closest existing buckets
-    if (targetBucketIndex < 0 || !this.buckets.has(targetBucketIndex)) {
-      // Iterate through all buckets to find the most relevant ones
+      processedBuckets.add(targetBucketIndex);
+    } else {
+      // Add all buckets in order of minimum possible distance
       for (const index of this.buckets.keys()) {
-        enqueueBucket(index);
+        bucketQueue.push({
+          index,
+          minDistance: 1n << BigInt(index),
+        });
+        processedBuckets.add(index);
       }
     }
 
-    // Sort buckets by minimum distance
+    // Sort initial bucket queue by minimum distance
     bucketQueue.sort((a, b) => Number(a.minDistance - b.minDistance));
 
-    // Process buckets in order of relevance
-    while (bucketQueue.length > 0 && closestNodes.length < count) {
+    // Process buckets in order of potential closeness
+    while (bucketQueue.length > 0) {
       const bucketItem = bucketQueue.shift();
       if (!bucketItem) continue;
 
-      const { index } = bucketItem;
+      const { index, minDistance } = bucketItem;
       const bucket = this.buckets.get(index);
 
       if (!bucket) continue;
 
+      // Skip this bucket if we have count nodes and the minimum distance to this bucket
+      // is greater than our current maximum distance
+      const farthestNode = maxHeap.peek();
+      if (maxHeap.size >= count && farthestNode && minDistance >= farthestNode.priority) {
+        continue;
+      }
+
       // Examine all nodes in this bucket
       for (const node of bucket.getAllNodes()) {
-        const nodeIdHex = node.id.toHex();
-
-        // Avoid duplicates
-        if (addedNodeIds.has(nodeIdHex)) continue;
-
-        // Calculate distance
         const distance = calculateScalarDistance(targetId, node.id);
-
-        // If we don't have k nodes yet, add this node
-        if (closestNodes.length < count) {
-          closestNodes.push({ distance, node });
-          addedNodeIds.add(nodeIdHex);
-
-          // Reorganize the heap if necessary
-          closestNodes.sort((a, b) => Number(b.distance - a.distance));
-        }
-        // Otherwise, check if this node is closer than the farthest in our list
-        else if (distance < closestNodes[0].distance) {
-          // Remove the farthest node
-          const removedNode = closestNodes.shift();
-          if (removedNode) {
-            addedNodeIds.delete(removedNode.node.id.toHex());
-          }
-
-          // Add this new closer node
-          closestNodes.push({ distance, node });
-          addedNodeIds.add(nodeIdHex);
-
-          // Reorganize the heap
-          closestNodes.sort((a, b) => Number(b.distance - a.distance));
+        
+        // If the heap is not full, add the node
+        if (maxHeap.size < count) {
+          maxHeap.push(distance, node);
+        } 
+        // Otherwise, try to replace the farthest node if this one is closer
+        else {
+          maxHeap.pushOrReplace(distance, node);
         }
       }
 
-      // If we already have k nodes, check if we can prune other buckets
-      if (closestNodes.length >= count) {
-        const farthestDistance = closestNodes[0].distance;
-
-        // Filter out buckets whose minimum distance is greater than our farthest node
-        bucketQueue.filter((item) => item.minDistance < farthestDistance);
+      // Consider sibling buckets that might contain closer nodes
+      const siblingIndex = this.getSiblingBucketIndex(index);
+      if (siblingIndex !== null && !processedBuckets.has(siblingIndex)) {
+        bucketQueue.push({
+          index: siblingIndex,
+          minDistance: 1n << BigInt(siblingIndex),
+        });
+        processedBuckets.add(siblingIndex);
+        // Re-sort the queue
+        bucketQueue.sort((a, b) => Number(a.minDistance - b.minDistance));
       }
     }
 
-    // Extract nodes in order (from closest to farthest)
-    return closestNodes.reverse().map((item) => item.node);
+    // Extract nodes from heap in order (closest first)
+    return maxHeap.values();
+  }
+
+  /**
+   * Find the sibling bucket index for a given bucket index
+   * @param index The bucket index
+   * @returns The sibling index or null if not found
+   * @private
+   */
+  private getSiblingBucketIndex(index: number): number | null {
+    // For classic Kademlia, siblings differ at the highest significant bit
+    const siblingIndex = index ^ 1; // Flip the lowest bit
+    return this.buckets.has(siblingIndex) ? siblingIndex : null;
   }
 
   /**
