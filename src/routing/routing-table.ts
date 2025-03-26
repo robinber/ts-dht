@@ -1,4 +1,5 @@
 import { NodeId, calculateScalarDistance, log2Distance } from "../core";
+import { MaxHeap } from "../utils/max-heap";
 import { type DHTNode, KBucket } from "./k-bucket";
 import type { NodeLocator } from "./node-locator";
 
@@ -122,11 +123,10 @@ export class RoutingTable implements NodeLocator {
 
   /**
    * Find the k closest nodes to a target NodeId.
-   * Uses optimized distance calculations and bucket structure for efficiency.
+   * Uses an optimized bucket traversal strategy and binary heap for efficient node selection.
    * @param targetId Target NodeId
    * @param count Maximum number of nodes to return
    * @returns List of k closest nodes to the target NodeId
-   * @TODO: Optimize this method with a max heap instead of sorting the array
    */
   findClosestNodes(targetId: NodeId, count = this.k): DHTNode[] {
     // Special case: if target is our own nodeId and buckets are sorted
@@ -138,96 +138,223 @@ export class RoutingTable implements NodeLocator {
     // This gives us the most relevant bucket to examine first
     const targetBucketIndex = log2Distance(targetId, this.localNodeId);
 
-    // Create a min-heap to maintain the k closest nodes
-    const closestNodes: { distance: bigint; node: DHTNode }[] = [];
-    const addedNodeIds = new Set<string>();
+    // Create a max heap to efficiently maintain the k closest nodes
+    const maxHeap = new MaxHeap<DHTNode>((node) => node.id.toHex());
 
-    // Create a priority queue of buckets to examine, starting with the most relevant
-    const bucketQueue: { index: number; minDistance: bigint }[] = [];
-
-    // Add the most relevant bucket to the queue
-    if (targetBucketIndex >= 0) {
-      bucketQueue.push({
-        index: targetBucketIndex,
-        minDistance: 1n << BigInt(targetBucketIndex),
-      });
+    // Process buckets using a more efficient approach
+    if (this.buckets.size <= 3) {
+      // For small routing tables, just process all buckets directly
+      // This avoids overhead of queue management for small tables
+      this.processAllBuckets(targetId, maxHeap, count);
+    } else {
+      // For larger routing tables, use a more strategic bucket traversal
+      this.processStrategicBuckets(targetId, targetBucketIndex, maxHeap, count);
     }
 
-    // Function to add a bucket to the priority queue
-    const enqueueBucket = (index: number) => {
-      if (this.buckets.has(index)) {
-        const minDistance = 1n << BigInt(index);
-        bucketQueue.push({ index, minDistance });
-      }
-    };
+    // Extract nodes from heap in order (closest first)
+    return maxHeap.values();
+  }
 
-    // If the most relevant bucket doesn't exist, add the closest existing buckets
-    if (targetBucketIndex < 0 || !this.buckets.has(targetBucketIndex)) {
-      // Iterate through all buckets to find the most relevant ones
-      for (const index of this.buckets.keys()) {
-        enqueueBucket(index);
-      }
-    }
+  /**
+   * Process all buckets directly for small routing tables
+   * @param targetId Target NodeId
+   * @param maxHeap The max heap to store closest nodes
+   * @param count Maximum number of nodes to collect
+   * @private
+   */
+  private processAllBuckets(
+    targetId: NodeId,
+    maxHeap: MaxHeap<DHTNode>,
+    count: number,
+  ): void {
+    // Get all buckets sorted by potential relevance (estimated by bucket index)
+    const bucketIndexes = Array.from(this.buckets.keys()).sort((a, b) => {
+      const distA =
+        a === 0
+          ? Number.POSITIVE_INFINITY
+          : Math.abs(a - (targetId.getBit(0) ? 1 : 0));
+      const distB =
+        b === 0
+          ? Number.POSITIVE_INFINITY
+          : Math.abs(b - (targetId.getBit(0) ? 1 : 0));
+      return distA - distB;
+    });
 
-    // Sort buckets by minimum distance
-    bucketQueue.sort((a, b) => Number(a.minDistance - b.minDistance));
-
-    // Process buckets in order of relevance
-    while (bucketQueue.length > 0 && closestNodes.length < count) {
-      const bucketItem = bucketQueue.shift();
-      if (!bucketItem) continue;
-
-      const { index } = bucketItem;
+    // Process buckets in order
+    for (const index of bucketIndexes) {
       const bucket = this.buckets.get(index);
-
       if (!bucket) continue;
 
       // Examine all nodes in this bucket
       for (const node of bucket.getAllNodes()) {
-        const nodeIdHex = node.id.toHex();
-
-        // Avoid duplicates
-        if (addedNodeIds.has(nodeIdHex)) continue;
-
-        // Calculate distance
         const distance = calculateScalarDistance(targetId, node.id);
 
-        // If we don't have k nodes yet, add this node
-        if (closestNodes.length < count) {
-          closestNodes.push({ distance, node });
-          addedNodeIds.add(nodeIdHex);
-
-          // Reorganize the heap if necessary
-          closestNodes.sort((a, b) => Number(b.distance - a.distance));
+        // If the heap is not full, add the node
+        if (maxHeap.size < count) {
+          maxHeap.push(distance, node);
         }
-        // Otherwise, check if this node is closer than the farthest in our list
-        else if (distance < closestNodes[0].distance) {
-          // Remove the farthest node
-          const removedNode = closestNodes.shift();
-          if (removedNode) {
-            addedNodeIds.delete(removedNode.node.id.toHex());
-          }
-
-          // Add this new closer node
-          closestNodes.push({ distance, node });
-          addedNodeIds.add(nodeIdHex);
-
-          // Reorganize the heap
-          closestNodes.sort((a, b) => Number(b.distance - a.distance));
+        // Otherwise, try to replace the farthest node if this one is closer
+        else {
+          maxHeap.pushOrReplace(distance, node);
         }
       }
+    }
+  }
 
-      // If we already have k nodes, check if we can prune other buckets
-      if (closestNodes.length >= count) {
-        const farthestDistance = closestNodes[0].distance;
+  /**
+   * Process buckets strategically for larger routing tables
+   * @param targetId Target NodeId
+   * @param targetBucketIndex The estimated bucket index for the target
+   * @param maxHeap The max heap to store closest nodes
+   * @param count Maximum number of nodes to collect
+   * @private
+   */
+  private processStrategicBuckets(
+    targetId: NodeId,
+    targetBucketIndex: number,
+    maxHeap: MaxHeap<DHTNode>,
+    count: number,
+  ): void {
+    // Initialize bucket tracking structures
+    const pendingBuckets = new Map<number, bigint>(); // Map of bucket index to min distance
+    const processedBuckets = new Set<number>();
 
-        // Filter out buckets whose minimum distance is greater than our farthest node
-        bucketQueue.filter((item) => item.minDistance < farthestDistance);
+    // Start with most relevant bucket based on target's position
+    if (targetBucketIndex >= 0 && this.buckets.has(targetBucketIndex)) {
+      pendingBuckets.set(targetBucketIndex, 1n << BigInt(targetBucketIndex));
+    } else {
+      // If target bucket doesn't exist, start with the most likely relevant ones
+      // Use logarithmic bit distance to estimate relevance
+      for (const index of this.buckets.keys()) {
+        pendingBuckets.set(index, 1n << BigInt(index));
       }
     }
 
-    // Extract nodes in order (from closest to farthest)
-    return closestNodes.reverse().map((item) => item.node);
+    // Process buckets until we run out or have enough nodes
+    while (pendingBuckets.size > 0) {
+      // Find closest bucket by minimum possible distance
+      let closestBucketIndex = -1;
+      let minPossibleDistance = 2n ** 160n; // Larger than any possible XOR distance
+
+      for (const [index, distance] of pendingBuckets.entries()) {
+        if (distance < minPossibleDistance) {
+          minPossibleDistance = distance;
+          closestBucketIndex = index;
+        }
+      }
+
+      if (closestBucketIndex === -1) break;
+
+      // Remove this bucket from pending list
+      pendingBuckets.delete(closestBucketIndex);
+      processedBuckets.add(closestBucketIndex);
+
+      // Get the current farthest node in our result set
+      const farthestNode = maxHeap.peek();
+
+      // Skip this bucket if we have enough nodes and this bucket can't have closer nodes
+      if (
+        maxHeap.isFull(count) &&
+        farthestNode &&
+        minPossibleDistance >= farthestNode.priority
+      ) {
+        continue;
+      }
+
+      // Process this bucket
+      const bucket = this.buckets.get(closestBucketIndex);
+      if (!bucket) continue;
+
+      // Process all nodes in the bucket
+      for (const node of bucket.getAllNodes()) {
+        const distance = calculateScalarDistance(targetId, node.id);
+
+        // Add to our result set if applicable
+        if (maxHeap.size < count) {
+          maxHeap.push(distance, node);
+        } else {
+          maxHeap.pushOrReplace(distance, node);
+        }
+      }
+
+      // Add parent, sibling and child buckets that might contain closer nodes
+      // We need to expand the search space strategically
+      this.addRelatedBuckets(
+        closestBucketIndex,
+        pendingBuckets,
+        processedBuckets,
+      );
+    }
+  }
+
+  /**
+   * Add related buckets that might contain nodes of interest
+   * @param bucketIndex The current bucket index
+   * @param pendingBuckets Map of pending buckets
+   * @param processedBuckets Set of already processed buckets
+   * @private
+   */
+  private addRelatedBuckets(
+    bucketIndex: number,
+    pendingBuckets: Map<number, bigint>,
+    processedBuckets: Set<number>,
+  ): void {
+    // In Kademlia, we need to consider:
+    // 1. The sibling bucket (differing by 1 bit)
+    // 2. The parent bucket (if it exists)
+    // 3. Child buckets (if they exist)
+
+    // Add sibling (flip the lowest bit)
+    const siblingIndex = bucketIndex ^ 1;
+    if (this.buckets.has(siblingIndex) && !processedBuckets.has(siblingIndex)) {
+      pendingBuckets.set(siblingIndex, 1n << BigInt(siblingIndex));
+    }
+
+    // Add potential child buckets
+    // In Kademlia, a child bucket would have an index one higher
+    const childIndex = bucketIndex + 1;
+    if (this.buckets.has(childIndex) && !processedBuckets.has(childIndex)) {
+      pendingBuckets.set(childIndex, 1n << BigInt(childIndex));
+    }
+
+    // Consider adjacency in higher bits (useful in some Kademlia variants)
+    // These are buckets that share a prefix but differ in higher bits
+    for (const index of this.buckets.keys()) {
+      if (!processedBuckets.has(index) && !pendingBuckets.has(index)) {
+        // Check if buckets share a long prefix (meaning they're "close" in the tree)
+        // This is a heuristic to find related buckets in the routing tree
+        const prefixLength = this.getSharedPrefixLength(bucketIndex, index);
+        if (prefixLength > 0) {
+          pendingBuckets.set(index, 1n << BigInt(index));
+        }
+      }
+    }
+  }
+
+  /**
+   * Calculate the length of the shared prefix between two bucket indexes
+   * @param a First bucket index
+   * @param b Second bucket index
+   * @returns Number of shared prefix bits
+   * @private
+   */
+  private getSharedPrefixLength(a: number, b: number): number {
+    if (a === b) return 32; // Same bucket
+
+    // XOR the indexes and count leading zeros
+    const xor = a ^ b;
+    if (xor === 0) return 32;
+
+    // Count leading zeros (shared prefix length)
+    let count = 0;
+    let mask = 1 << 31; // Start with highest bit
+
+    while ((xor & mask) === 0 && mask > 0) {
+      count++;
+      mask >>>= 1;
+    }
+
+    return count;
   }
 
   /**
